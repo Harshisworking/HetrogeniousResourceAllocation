@@ -1,0 +1,21 @@
+# Maven-generated build output
+target/
+*.class
+
+# IntelliJ IDEA
+.idea/
+*.iml
+out/
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+
+# Operating-system files
+.DS_Store
+Thumbs.db
+desktop.ini
