@@ -1,5 +1,7 @@
 package com.harsh.cloudsim.policy;
 
+import com.harsh.cloudsim.agent.model.DecisionSource;
+import com.harsh.cloudsim.agent.model.PlacementDecision;
 import com.harsh.cloudsim.model.HeterogeneousCluster;
 import org.cloudbus.cloudsim.core.CloudSim;
 import org.cloudbus.cloudsim.datacenters.DatacenterSimple;
@@ -12,33 +14,27 @@ import org.junit.jupiter.api.Test;
 import java.util.List;
 import java.util.Optional;
 
+import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class FlexibleVmAllocationPolicyTest {
 
-    private List<Host> hosts;
     private FlexibleVmAllocationPolicy policy;
 
     @BeforeEach
     void setUpFreshClusterAndPolicy() {
         CloudSim simulation = new CloudSim();
+        List<Host> hosts =
+                HeterogeneousCluster.createClusterHosts();
 
-        hosts = HeterogeneousCluster.createClusterHosts();
         policy = new FlexibleVmAllocationPolicy();
 
-        /*
-         * Creating the datacenter connects:
-         *
-         * CloudSim simulation
-         *       +
-         * heterogeneous hosts
-         *       +
-         * allocation policy
-         *
-         * This also makes the hosts available through policy.getHostList().
-         */
-        new DatacenterSimple(simulation, hosts, policy);
+        new DatacenterSimple(
+                simulation,
+                hosts,
+                policy
+        );
     }
 
     @Test
@@ -53,15 +49,23 @@ class FlexibleVmAllocationPolicyTest {
         Optional<Host> selectedHost =
                 policy.defaultFindHostForVm(heavyVm);
 
-        assertTrue(
-                selectedHost.isPresent(),
-                "The policy should find a suitable host for the heavy VM."
-        );
+        PlacementDecision decision =
+                policy.getLastDecision().orElseThrow();
 
-        assertEquals(
-                0,
-                selectedHost.orElseThrow().getId(),
-                "A heavy VM should be assigned to laptop Host 0."
+        assertAll(
+                () -> assertTrue(selectedHost.isPresent()),
+                () -> assertEquals(
+                        0,
+                        selectedHost.orElseThrow().getId()
+                ),
+                () -> assertEquals(
+                        0,
+                        decision.targetHostId()
+                ),
+                () -> assertEquals(
+                        DecisionSource.STANDALONE_RULE,
+                        decision.source()
+                )
         );
     }
 
@@ -77,20 +81,24 @@ class FlexibleVmAllocationPolicyTest {
         Optional<Host> selectedHost =
                 policy.defaultFindHostForVm(lightVm);
 
-        assertTrue(
-                selectedHost.isPresent(),
-                "The policy should find a suitable host for the light VM."
-        );
+        PlacementDecision decision =
+                policy.getLastDecision().orElseThrow();
 
-        assertEquals(
-                1,
-                selectedHost.orElseThrow().getId(),
-                "A light VM should be assigned to phone Host 1."
+        assertAll(
+                () -> assertTrue(selectedHost.isPresent()),
+                () -> assertEquals(
+                        1,
+                        selectedHost.orElseThrow().getId()
+                ),
+                () -> assertEquals(
+                        DecisionSource.STANDALONE_RULE,
+                        decision.source()
+                )
         );
     }
 
     @Test
-    void shouldAllowExternalAgentToOverrideStandaloneRule() {
+    void shouldAllowStructuredAgentDecisionToOverrideRule() {
         Vm lightVm = createVm(
                 2,
                 1_000,
@@ -98,31 +106,46 @@ class FlexibleVmAllocationPolicyTest {
                 1_024
         );
 
-        /*
-         * Without an external decision, the standalone rule would send this
-         * light VM to Host 1.
-         *
-         * Here we simulate a future AI agent requesting Host 0.
-         */
-        policy.setExternalDecisionEngine(vm -> 0);
+        policy.setExternalDecisionEngine(
+                (vm, availableHosts) ->
+                        new PlacementDecision(
+                                vm.getId(),
+                                0,
+                                0.92,
+                                "Laptop selected to provide additional capacity.",
+                                DecisionSource.EXTERNAL_AGENT
+                        )
+        );
 
         Optional<Host> selectedHost =
                 policy.defaultFindHostForVm(lightVm);
 
-        assertTrue(
-                selectedHost.isPresent(),
-                "The agent-selected host should be accepted when suitable."
-        );
+        PlacementDecision acceptedDecision =
+                policy.getLastDecision().orElseThrow();
 
-        assertEquals(
-                0,
-                selectedHost.orElseThrow().getId(),
-                "The valid external-agent decision should override the standalone rule."
+        assertAll(
+                () -> assertTrue(selectedHost.isPresent()),
+                () -> assertEquals(
+                        0,
+                        selectedHost.orElseThrow().getId()
+                ),
+                () -> assertEquals(
+                        0.92,
+                        acceptedDecision.confidence()
+                ),
+                () -> assertEquals(
+                        DecisionSource.EXTERNAL_AGENT,
+                        acceptedDecision.source()
+                ),
+                () -> assertEquals(
+                        "Laptop selected to provide additional capacity.",
+                        acceptedDecision.reason()
+                )
         );
     }
 
     @Test
-    void shouldRejectInvalidAgentHostAndUseStandaloneFallback() {
+    void shouldRejectUnknownAgentHostAndUseFallbackRule() {
         Vm lightVm = createVm(
                 3,
                 1_000,
@@ -130,29 +153,37 @@ class FlexibleVmAllocationPolicyTest {
                 1_024
         );
 
-        /*
-         * Host 99 does not exist.
-         * The policy must not crash or blindly accept this decision.
-         */
-        policy.setExternalDecisionEngine(vm -> 99);
+        policy.setExternalDecisionEngine(
+                (vm, availableHosts) ->
+                        new PlacementDecision(
+                                vm.getId(),
+                                99,
+                                0.75,
+                                "Agent requested an unknown host.",
+                                DecisionSource.EXTERNAL_AGENT
+                        )
+        );
 
         Optional<Host> selectedHost =
                 policy.defaultFindHostForVm(lightVm);
 
-        assertTrue(
-                selectedHost.isPresent(),
-                "The standalone rule should recover from an invalid agent decision."
-        );
+        PlacementDecision fallbackDecision =
+                policy.getLastDecision().orElseThrow();
 
-        assertEquals(
-                1,
-                selectedHost.orElseThrow().getId(),
-                "An invalid agent decision should fall back to phone Host 1."
+        assertAll(
+                () -> assertEquals(
+                        1,
+                        selectedHost.orElseThrow().getId()
+                ),
+                () -> assertEquals(
+                        DecisionSource.STANDALONE_RULE,
+                        fallbackDecision.source()
+                )
         );
     }
 
     @Test
-    void shouldRecoverWhenExternalAgentThrowsException() {
+    void shouldRejectDecisionForDifferentVm() {
         Vm lightVm = createVm(
                 4,
                 1_000,
@@ -160,26 +191,98 @@ class FlexibleVmAllocationPolicyTest {
                 1_024
         );
 
-        /*
-         * This deliberately simulates an LLM, ML model or agent service
-         * failing while making its decision.
-         */
-        policy.setExternalDecisionEngine(vm -> {
-            throw new IllegalStateException("Simulated agent failure");
-        });
+        policy.setExternalDecisionEngine(
+                (vm, availableHosts) ->
+                        new PlacementDecision(
+                                999,
+                                0,
+                                0.90,
+                                "Decision accidentally produced for another VM.",
+                                DecisionSource.EXTERNAL_AGENT
+                        )
+        );
 
         Optional<Host> selectedHost =
                 policy.defaultFindHostForVm(lightVm);
 
-        assertTrue(
-                selectedHost.isPresent(),
-                "The policy should recover when the external agent fails."
+        PlacementDecision fallbackDecision =
+                policy.getLastDecision().orElseThrow();
+
+        assertAll(
+                () -> assertEquals(
+                        1,
+                        selectedHost.orElseThrow().getId()
+                ),
+                () -> assertEquals(
+                        DecisionSource.STANDALONE_RULE,
+                        fallbackDecision.source()
+                )
+        );
+    }
+
+    @Test
+    void shouldRecoverWhenExternalAgentThrowsException() {
+        Vm lightVm = createVm(
+                5,
+                1_000,
+                1,
+                1_024
         );
 
-        assertEquals(
+        policy.setExternalDecisionEngine(
+                (vm, availableHosts) -> {
+                    throw new IllegalStateException(
+                            "Simulated agent failure"
+                    );
+                }
+        );
+
+        Optional<Host> selectedHost =
+                policy.defaultFindHostForVm(lightVm);
+
+        PlacementDecision fallbackDecision =
+                policy.getLastDecision().orElseThrow();
+
+        assertAll(
+                () -> assertEquals(
+                        1,
+                        selectedHost.orElseThrow().getId()
+                ),
+                () -> assertEquals(
+                        DecisionSource.STANDALONE_RULE,
+                        fallbackDecision.source()
+                )
+        );
+    }
+
+    @Test
+    void shouldRecoverWhenExternalAgentReturnsNull() {
+        Vm lightVm = createVm(
+                6,
+                1_000,
                 1,
-                selectedHost.orElseThrow().getId(),
-                "Agent failure should activate the standalone fallback rule."
+                1_024
+        );
+
+        policy.setExternalDecisionEngine(
+                (vm, availableHosts) -> null
+        );
+
+        Optional<Host> selectedHost =
+                policy.defaultFindHostForVm(lightVm);
+
+        PlacementDecision fallbackDecision =
+                policy.getLastDecision().orElseThrow();
+
+        assertAll(
+                () -> assertEquals(
+                        1,
+                        selectedHost.orElseThrow().getId()
+                ),
+                () -> assertEquals(
+                        DecisionSource.STANDALONE_RULE,
+                        fallbackDecision.source()
+                )
         );
     }
 
