@@ -7,6 +7,10 @@ import com.google.adk.sessions.Session;
 import com.google.genai.types.Content;
 import com.google.genai.types.Part;
 import com.harsh.cloudsim.agent.event.model.EventImpactAssessment;
+import com.harsh.cloudsim.agent.verification.EventVerificationAgent;
+import com.harsh.cloudsim.agent.verification.model.EventVerificationRequest;
+import com.harsh.cloudsim.agent.verification.model.EventVerificationResult;
+import com.harsh.cloudsim.agent.verification.model.VerificationStatus;
 import io.reactivex.rxjava3.core.Flowable;
 
 import java.util.Scanner;
@@ -15,11 +19,8 @@ import java.util.concurrent.atomic.AtomicReference;
 import static java.nio.charset.StandardCharsets.UTF_8;
 
 /**
- * Interactive command-line program for manually testing the
- * Gemini-powered Event Intelligence Agent.
- *
- * The runner sends an event description to Gemini, captures the final
- * JSON response, validates it and converts it into a typed Java object.
+ * Interactive workflow connecting the Gemini Event Intelligence Agent
+ * to the deterministic Event Verification Agent.
  */
 public final class EventAgentCliRunner {
 
@@ -49,12 +50,15 @@ public final class EventAgentCliRunner {
                 )
                 .blockingGet();
 
+        EventVerificationAgent verificationAgent =
+                new EventVerificationAgent();
+
         System.out.println(
-                "Event Intelligence Agent is ready."
+                "Event Intelligence and Verification workflow is ready."
         );
 
         System.out.println(
-                "Describe an event, or enter 'quit' to stop."
+                "Enter 'quit' at any prompt to stop."
         );
 
         try (Scanner scanner = new Scanner(System.in, UTF_8)) {
@@ -62,7 +66,8 @@ public final class EventAgentCliRunner {
                     scanner,
                     runner,
                     session,
-                    runConfig
+                    runConfig,
+                    verificationAgent
             );
         }
     }
@@ -71,15 +76,16 @@ public final class EventAgentCliRunner {
             Scanner scanner,
             InMemoryRunner runner,
             Session session,
-            RunConfig runConfig
+            RunConfig runConfig,
+            EventVerificationAgent verificationAgent
     ) {
         while (true) {
-            System.out.print("\nEvent > ");
+            System.out.print("\nEvent description > ");
 
             String userInput = scanner.nextLine().trim();
 
-            if (QUIT_COMMAND.equalsIgnoreCase(userInput)) {
-                System.out.println("Event agent stopped.");
+            if (isQuitCommand(userInput)) {
+                stopAgent();
                 return;
             }
 
@@ -90,49 +96,96 @@ public final class EventAgentCliRunner {
                 continue;
             }
 
-            try {
-                EventImpactAssessment assessment =
-                        generateAssessment(
-                                userInput,
-                                runner,
-                                session,
-                                runConfig
-                        );
+            System.out.print("Source URL/domain > ");
 
-                printAssessment(assessment);
-            } catch (EventAssessmentParsingException exception) {
-                System.err.println(
-                        "\nThe agent returned an invalid assessment."
-                );
+            String sourceReference =
+                    scanner.nextLine().trim();
 
-                System.err.println(
-                        "Reason: " + exception.getMessage()
-                );
-
-                System.err.println(
-                        "No scaling decision will be made "
-                                + "from this response."
-                );
-            } catch (RuntimeException exception) {
-                System.err.println(
-                        "\nThe Gemini request could not be completed."
-                );
-
-                System.err.println(
-                        "Reason: " + readableMessage(exception)
-                );
-
-                System.err.println(
-                        "You may correct the problem and try again."
-                );
+            if (isQuitCommand(sourceReference)) {
+                stopAgent();
+                return;
             }
+
+            if (sourceReference.isBlank()) {
+                System.out.println(
+                        "A source URL or domain is required "
+                                + "for verification."
+                );
+                continue;
+            }
+
+            processEvent(
+                    userInput,
+                    sourceReference,
+                    runner,
+                    session,
+                    runConfig,
+                    verificationAgent
+            );
         }
     }
 
-    /**
-     * Sends the event description to Gemini and converts the final
-     * response into a validated EventImpactAssessment.
-     */
+    private static void processEvent(
+            String userInput,
+            String sourceReference,
+            InMemoryRunner runner,
+            Session session,
+            RunConfig runConfig,
+            EventVerificationAgent verificationAgent
+    ) {
+        try {
+            EventImpactAssessment assessment =
+                    generateAssessment(
+                            userInput,
+                            runner,
+                            session,
+                            runConfig
+                    );
+
+            printAssessment(assessment);
+
+            EventVerificationRequest verificationRequest =
+                    new EventVerificationRequest(
+                            assessment,
+                            sourceReference
+                    );
+
+            EventVerificationResult verificationResult =
+                    verificationAgent.verify(
+                            verificationRequest
+                    );
+
+            printVerificationResult(
+                    verificationResult
+            );
+        } catch (EventAssessmentParsingException exception) {
+            System.err.println(
+                    "\nThe Event Intelligence Agent returned "
+                            + "an invalid assessment."
+            );
+
+            System.err.println(
+                    "Reason: " + exception.getMessage()
+            );
+
+            System.err.println(
+                    "Safety decision: BLOCKED"
+            );
+        } catch (RuntimeException exception) {
+            System.err.println(
+                    "\nThe event workflow could not be completed."
+            );
+
+            System.err.println(
+                    "Reason: " + readableMessage(exception)
+            );
+
+            System.err.println(
+                    "Safety decision: BLOCKED"
+            );
+        }
+    }
+
     private static EventImpactAssessment generateAssessment(
             String userInput,
             InMemoryRunner runner,
@@ -172,9 +225,6 @@ public final class EventAgentCliRunner {
         return EventAssessmentParser.parse(rawResponse);
     }
 
-    /**
-     * Displays the validated Java object in a human-readable format.
-     */
     private static void printAssessment(
             EventImpactAssessment assessment
     ) {
@@ -215,22 +265,69 @@ public final class EventAgentCliRunner {
         );
 
         System.out.printf(
-                "Confidence: %.2f%n",
+                "LLM confidence: %.2f%n",
                 assessment.confidence()
         );
 
         System.out.println(
                 "Reasoning: " + assessment.reasoning()
         );
-
-        System.out.println(
-                "Validation status: ACCEPTED"
-        );
     }
 
-    /**
-     * Traverses wrapped exceptions to find the most useful message.
-     */
+    private static void printVerificationResult(
+            EventVerificationResult result
+    ) {
+        System.out.println(
+                "\nEvent Verification Agent result"
+        );
+
+        System.out.println(
+                "-------------------------------"
+        );
+
+        System.out.println(
+                "Status: " + result.status()
+        );
+
+        System.out.printf(
+                "Verification score: %.2f%n",
+                result.verificationScore()
+        );
+
+        System.out.println(
+                "Source domain: "
+                        + result.normalizedSourceDomain()
+        );
+
+        System.out.println("Verification findings:");
+
+        result.reasons().forEach(
+                reason -> System.out.println(
+                        "- " + reason
+                )
+        );
+
+        if (result.status()
+                == VerificationStatus.VERIFIED) {
+            System.out.println(
+                    "Gate decision: APPROVED for workload prediction"
+            );
+        } else {
+            System.out.println(
+                    "Gate decision: BLOCKED from automatic "
+                            + "workload prediction"
+            );
+        }
+    }
+
+    private static boolean isQuitCommand(String input) {
+        return QUIT_COMMAND.equalsIgnoreCase(input);
+    }
+
+    private static void stopAgent() {
+        System.out.println("Event workflow stopped.");
+    }
+
     private static String readableMessage(Throwable throwable) {
         Throwable current = throwable;
 
@@ -247,10 +344,6 @@ public final class EventAgentCliRunner {
         return message;
     }
 
-    /**
-     * Fails early with a clear message instead of sending an
-     * unauthenticated request to Gemini.
-     */
     private static void verifyApiKey() {
         String apiKey = System.getenv("GOOGLE_API_KEY");
 

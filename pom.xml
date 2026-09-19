@@ -11,19 +11,35 @@
     <version>1.0-SNAPSHOT</version>
 
     <name>Heterogeneous Resource Allocation</name>
+
     <description>
         CloudSim-based heterogeneous resource allocation foundation
         for event-aware agentic cloud management.
     </description>
 
     <properties>
+        <!-- Java configuration -->
         <maven.compiler.source>24</maven.compiler.source>
         <maven.compiler.target>24</maven.compiler.target>
-        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <project.build.sourceEncoding>
+            UTF-8
+        </project.build.sourceEncoding>
 
+        <!-- Dependency versions -->
+        <cloudsimplus.version>7.3.0</cloudsimplus.version>
         <junit.version>5.11.4</junit.version>
         <adk.version>1.6.0</adk.version>
         <gson.version>2.14.0</gson.version>
+        <jsoup.version>1.23.2</jsoup.version>
+
+        <!-- Maven plugin versions -->
+        <maven.compiler.plugin.version>
+            3.11.0
+        </maven.compiler.plugin.version>
+
+        <maven.surefire.plugin.version>
+            3.5.2
+        </maven.surefire.plugin.version>
     </properties>
 
     <dependencies>
@@ -32,7 +48,7 @@
         <dependency>
             <groupId>org.cloudsimplus</groupId>
             <artifactId>cloudsimplus</artifactId>
-            <version>7.3.0</version>
+            <version>${cloudsimplus.version}</version>
         </dependency>
 
         <!-- Google Agent Development Kit for Java -->
@@ -49,6 +65,13 @@
             <version>${gson.version}</version>
         </dependency>
 
+        <!-- Parses downloaded HTML into visible webpage evidence -->
+        <dependency>
+            <groupId>org.jsoup</groupId>
+            <artifactId>jsoup</artifactId>
+            <version>${jsoup.version}</version>
+        </dependency>
+
         <!-- Unit-testing framework -->
         <dependency>
             <groupId>org.junit.jupiter</groupId>
@@ -62,19 +85,26 @@
     <build>
         <plugins>
 
+            <!-- Compiles the project using Java 24 -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-compiler-plugin</artifactId>
-                <version>3.11.0</version>
+                <version>
+                    ${maven.compiler.plugin.version}
+                </version>
+
                 <configuration>
                     <release>24</release>
                 </configuration>
             </plugin>
 
+            <!-- Discovers and executes JUnit 5 tests -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-surefire-plugin</artifactId>
-                <version>3.5.2</version>
+                <version>
+                    ${maven.surefire.plugin.version}
+                </version>
             </plugin>
 
         </plugins>
