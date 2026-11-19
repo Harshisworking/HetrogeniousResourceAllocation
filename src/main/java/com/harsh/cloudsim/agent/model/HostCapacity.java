@@ -17,6 +17,14 @@ public class HostCapacity {
         return hostId;
     }
 
+    public long getAvailableRamMb() {
+        return availableRamMb;
+    }
+
+    public long getAvailablePes() {
+        return availablePes;
+    }
+
     public boolean canAllocate(long requestedRamMb, long requestedPes) {
         if (this.availableRamMb >= requestedRamMb && this.availablePes >= requestedPes) {
             return true;
