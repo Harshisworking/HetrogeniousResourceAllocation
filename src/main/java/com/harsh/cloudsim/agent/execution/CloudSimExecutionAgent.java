@@ -208,22 +208,26 @@ public class CloudSimExecutionAgent implements ExecutionAgent, PlacementDecision
 
             if (!allocationPolicy.getHostList().isEmpty()) {
                 allocationPolicy.allocateHostForVm(vm);
-                allocated = (vm.getHost() != null && vm.getHost() != Host.NULL);
-                Optional<PlacementDecision> policyDecision = allocationPolicy.getLastDecision();
-                if (policyDecision.isPresent()) {
-                    actualHostId = policyDecision.get().targetHostId();
-                    finalSource = policyDecision.get().source();
-                } else if (allocated) {
+                allocated = vm.getHost() != null && vm.getHost() != Host.NULL;
+                if (allocated) {
+                    // The VM's actual host is authoritative, including when
+                    // the policy selected a fallback host.
                     actualHostId = vm.getHost().getId();
+                    Optional<PlacementDecision> policyDecision = allocationPolicy.getLastDecision();
+                    if (policyDecision.isPresent()
+                            && policyDecision.get().vmId() == vmId
+                            && policyDecision.get().targetHostId() == actualHostId) {
+                        finalSource = policyDecision.get().source();
+                    } else {
+                        finalSource = DecisionSource.CLOUDSIM_FALLBACK;
+                    }
                 }
             }
 
-            if (broker != null) {
+            // Submitting a VM to the broker is not proof of successful host
+            // allocation. Never report EXECUTED for a merely queued VM.
+            if (allocated && broker != null) {
                 broker.submitVmList(List.of(vm));
-                if (!allocated && allocationPolicy.getHostList().isEmpty()) {
-                    allocated = true;
-                    actualHostId = proposal.targetHostId();
-                }
             }
 
             if (allocated) {
@@ -250,52 +254,78 @@ public class CloudSimExecutionAgent implements ExecutionAgent, PlacementDecision
                         "Failed to allocate Host for VM #" + vmId + "; insufficient capacity across all hosts."
                 );
             }
+        } catch (RuntimeException ex) {
+            return new ExecutedActionRecord(
+                    vmId, proposal.vmType(), VmScalingAction.PROVISION,
+                    proposal.targetHostId(), -1L, false,
+                    DecisionSource.EXTERNAL_AGENT,
+                    "VM allocation failed: " + ex.getClass().getSimpleName());
         } finally {
             pendingDecisions.remove(vmId);
         }
     }
 
     private ExecutedActionRecord executeDeprovision(VmScalingProposal proposal) {
-        Vm targetVm = null;
+        // A proposal identifies a tier, host and VM shape, not an exact VM ID.
+        // Never remove a VM from a different host simply because its PE count
+        // happens to match. Inventory removes a VM only after host release.
         for (int i = activeManagedVms.size() - 1; i >= 0; i--) {
             Vm candidate = activeManagedVms.get(i);
-            long hostId = (candidate.getHost() != null && candidate.getHost() != Host.NULL)
-                    ? candidate.getHost().getId()
-                    : -1L;
-            if (hostId == proposal.targetHostId() || candidate.getNumberOfPes() == proposal.requestedPes()) {
-                targetVm = candidate;
-                activeManagedVms.remove(i);
-                break;
+            Host host = candidate.getHost();
+            if (host == null || host == Host.NULL
+                    || host.getId() != proposal.targetHostId()
+                    || candidate.getNumberOfPes() != proposal.requestedPes()
+                    || candidate.getRam().getCapacity() != proposal.requestedRamMb()
+                    || (candidate.getMips() > 2000.0 ? HEAVY_VM_TYPE : 1) != proposal.vmType()) {
+                continue;
+            }
+
+            long previousHostId = host.getId();
+            // Some CloudSim versions keep the VM's previous host reference
+            // after deallocation. Verify the host's authoritative resource
+            // state instead of assuming candidate.getHost() becomes Host.NULL.
+            boolean wasHosted = host.getVmList().contains(candidate);
+            long availableRamBefore = host.getRam().getAvailableResource();
+            if (!wasHosted) {
+                return new ExecutedActionRecord(
+                        candidate.getId(), proposal.vmType(), VmScalingAction.DEPROVISION,
+                        proposal.targetHostId(), previousHostId, false,
+                        DecisionSource.EXTERNAL_AGENT,
+                        "VM #" + candidate.getId() + " was not present in Host #" + previousHostId + " inventory");
+            }
+            try {
+                allocationPolicy.deallocateHostForVm(candidate);
+                boolean removedFromHost = !host.getVmList().contains(candidate);
+                boolean ramReleased = host.getRam().getAvailableResource() > availableRamBefore;
+                if (removedFromHost && ramReleased) {
+                    activeManagedVms.remove(i);
+                    return new ExecutedActionRecord(
+                            candidate.getId(), proposal.vmType(), VmScalingAction.DEPROVISION,
+                            proposal.targetHostId(), previousHostId, true,
+                            DecisionSource.EXTERNAL_AGENT,
+                            "Deprovisioned VM #" + candidate.getId() + " from Host #" + previousHostId);
+                }
+                return new ExecutedActionRecord(
+                        candidate.getId(), proposal.vmType(), VmScalingAction.DEPROVISION,
+                        proposal.targetHostId(), previousHostId, false,
+                        DecisionSource.EXTERNAL_AGENT,
+                        "Deallocation could not confirm inventory removal and RAM release for VM #"
+                                + candidate.getId() + " from Host #" + previousHostId);
+            } catch (RuntimeException ex) {
+                return new ExecutedActionRecord(
+                        candidate.getId(), proposal.vmType(), VmScalingAction.DEPROVISION,
+                        proposal.targetHostId(), previousHostId, false,
+                        DecisionSource.EXTERNAL_AGENT,
+                        "Deallocation failed for VM #" + candidate.getId() + ": " + ex.getClass().getSimpleName());
             }
         }
 
-        if (targetVm != null) {
-            long previousHostId = (targetVm.getHost() != null && targetVm.getHost() != Host.NULL)
-                    ? targetVm.getHost().getId()
-                    : proposal.targetHostId();
-            allocationPolicy.deallocateHostForVm(targetVm);
-            return new ExecutedActionRecord(
-                    targetVm.getId(),
-                    proposal.vmType(),
-                    VmScalingAction.DEPROVISION,
-                    proposal.targetHostId(),
-                    previousHostId,
-                    true,
-                    DecisionSource.EXTERNAL_AGENT,
-                    "Deprovisioned VM #" + targetVm.getId() + " from Host #" + previousHostId
-            );
-        }
-
         return new ExecutedActionRecord(
-                -1L,
-                proposal.vmType(),
-                VmScalingAction.DEPROVISION,
-                proposal.targetHostId(),
-                -1L,
-                false,
-                DecisionSource.STANDALONE_RULE,
-                "No matching active VM found on Host #" + proposal.targetHostId() + " to deprovision."
-        );
+                -1L, proposal.vmType(), VmScalingAction.DEPROVISION,
+                proposal.targetHostId(), -1L, false,
+                DecisionSource.EXTERNAL_AGENT,
+                "No matching managed VM of requested type, host, PEs and RAM found on Host #"
+                        + proposal.targetHostId());
     }
 
     private ExecutionStatus resolveStatus(int provisioned, int deprovisioned, int failed) {
