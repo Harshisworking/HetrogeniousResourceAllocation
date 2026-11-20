@@ -7,6 +7,7 @@ import com.google.adk.sessions.Session;
 import com.google.genai.types.Content;
 import com.google.genai.types.Part;
 import com.harsh.cloudsim.agent.event.model.EventImpactAssessment;
+import com.harsh.cloudsim.integration.VerifiedEventCloudSimHandoff;
 import com.harsh.cloudsim.agent.verification.EventVerificationAgent;
 import com.harsh.cloudsim.agent.verification.claim.ClaimVerificationService;
 import com.harsh.cloudsim.agent.verification.claim.model.ClaimVerificationResult;
@@ -47,6 +48,12 @@ public final class EventAgentCliRunner {
     }
 
     public static void main(String[] args) {
+        // Explicit opt-in: the normal CLI continues to verify and report only.
+        // Any other CLI argument is rejected rather than silently ignored.
+        boolean cloudSimHandoff = args.length == 1 && "--cloudsim".equals(args[0]);
+        if (args.length > 0 && !cloudSimHandoff) {
+            throw new IllegalArgumentException("Usage: EventAgentCliRunner [--cloudsim]");
+        }
         verifyApiKey();
 
         RunConfig runConfig =
@@ -99,7 +106,8 @@ public final class EventAgentCliRunner {
                     runConfig,
                     verificationAgent,
                     evidenceFetcher,
-                    claimVerificationService
+                    claimVerificationService,
+                    cloudSimHandoff
             );
         }
     }
@@ -111,7 +119,8 @@ public final class EventAgentCliRunner {
             RunConfig runConfig,
             EventVerificationAgent verificationAgent,
             SourceEvidenceFetcher evidenceFetcher,
-            ClaimVerificationService claimVerificationService
+            ClaimVerificationService claimVerificationService,
+            boolean cloudSimHandoff
     ) {
         while (true) {
             System.out.print(
@@ -163,7 +172,8 @@ public final class EventAgentCliRunner {
                     runConfig,
                     verificationAgent,
                     evidenceFetcher,
-                    claimVerificationService
+                    claimVerificationService,
+                    cloudSimHandoff
             );
         }
     }
@@ -176,7 +186,8 @@ public final class EventAgentCliRunner {
             RunConfig runConfig,
             EventVerificationAgent verificationAgent,
             SourceEvidenceFetcher evidenceFetcher,
-            ClaimVerificationService claimVerificationService
+            ClaimVerificationService claimVerificationService,
+            boolean cloudSimHandoff
     ) {
         try {
             /*
@@ -317,6 +328,27 @@ public final class EventAgentCliRunner {
             printVerificationResult(
                     finalResult
             );
+
+            // Only the complete, evidence-backed Agent 2 result is eligible.
+            // Never use the preliminary or evidence-only verification status.
+            if (cloudSimHandoff) {
+                if (finalResult.status() == VerificationStatus.VERIFIED) {
+                    System.out.println("\nStage 6: Verified event -> CloudSim simulation...");
+                    var result = VerifiedEventCloudSimHandoff.run(assessment, finalResult);
+                    System.out.printf("CloudSim managed VMs: %d -> %d%n",
+                            result.before().runningVms(), result.after().runningVms());
+                    System.out.println("Forecast VMs=" + result.forecast().recommendedVmCount());
+                    System.out.println("Safety=" + result.safety().approvalStatus());
+                    System.out.println("Execution=" + result.execution().status()
+                            + ", provisioned=" + result.execution().provisionedCount()
+                            + ", failed=" + result.execution().failedCount());
+                    System.out.println("SIMULATION ONLY: no Kubernetes operations,"
+                            + " measured HTTP latency, or SLO evaluation.");
+                } else {
+                    System.out.println("CloudSim handoff BLOCKED: final status="
+                            + finalResult.status());
+                }
+            }
         } catch (EventAssessmentParsingException exception) {
             System.err.println(
                     "\nThe Event Intelligence Agent returned "
