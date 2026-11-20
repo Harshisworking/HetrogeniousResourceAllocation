@@ -7,20 +7,24 @@ import com.harsh.cloudsim.agent.verification.model.VerificationStatus;
 import java.util.Objects;
 
 /**
- * Trust-boundary handoff for the event CLI after FULL evidence-backed verification.
+ * Explicit, simulation-only handoff for a verified event.
  *
- * This adapter does not perform Gemini/HTTP verification itself. The caller must
- * use the final EventVerificationAgent.verify(request, evidence, claimResult)
- * result, never an intermediate or user-supplied assertion of verification.
+ * Verification means the event claim was supported by source evidence. It does
+ * NOT establish that the LLM-estimated audience size, traffic multiplier, or
+ * lead time are accurate. The caller must explicitly acknowledge that these
+ * estimates are uncalibrated before running a sandbox CloudSim demonstration.
  *
- * CloudSim VMs are allocated in-memory; no K8s changes or performance metrics.
+ * This does not authorize Kubernetes or any physical infrastructure actions.
  */
 public final class VerifiedEventCloudSimHandoff {
+    public static final String ACKNOWLEDGEMENT = "SIMULATE";
+
     private VerifiedEventCloudSimHandoff() {}
 
     public static ControlledPipelineDemo.RunResult run(
             EventImpactAssessment assessment,
-            EventVerificationResult finalVerification) {
+            EventVerificationResult finalVerification,
+            String acknowledgement) {
         Objects.requireNonNull(assessment, "Assessment required");
         Objects.requireNonNull(finalVerification, "Final verification required");
         if (finalVerification.status() != VerificationStatus.VERIFIED) {
@@ -28,7 +32,11 @@ public final class VerifiedEventCloudSimHandoff {
                     "CloudSim handoff denied: final event status is "
                             + finalVerification.status());
         }
-        // No synthetic or fabricated SLO measurements are passed to Agent 8.
+        if (!ACKNOWLEDGEMENT.equals(acknowledgement)) {
+            throw new IllegalArgumentException(
+                    "CloudSim handoff denied: explicit SIMULATE acknowledgement required. "
+                            + "Event verification does not validate traffic forecasts or event timing.");
+        }
         return ControlledPipelineDemo.run(
                 assessment, finalVerification, null, null, null);
     }

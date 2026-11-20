@@ -165,6 +165,7 @@ public final class EventAgentCliRunner {
             }
 
             processEvent(
+                    scanner,
                     originalEventClaim,
                     sourceReference,
                     eventIntelligenceRunner,
@@ -179,6 +180,7 @@ public final class EventAgentCliRunner {
     }
 
     private static void processEvent(
+            Scanner scanner,
             String originalEventClaim,
             String sourceReference,
             InMemoryRunner eventIntelligenceRunner,
@@ -333,17 +335,37 @@ public final class EventAgentCliRunner {
             // Never use the preliminary or evidence-only verification status.
             if (cloudSimHandoff) {
                 if (finalResult.status() == VerificationStatus.VERIFIED) {
-                    System.out.println("\nStage 6: Verified event -> CloudSim simulation...");
-                    var result = VerifiedEventCloudSimHandoff.run(assessment, finalResult);
-                    System.out.printf("CloudSim managed VMs: %d -> %d%n",
-                            result.before().runningVms(), result.after().runningVms());
-                    System.out.println("Forecast VMs=" + result.forecast().recommendedVmCount());
-                    System.out.println("Safety=" + result.safety().approvalStatus());
-                    System.out.println("Execution=" + result.execution().status()
-                            + ", provisioned=" + result.execution().provisionedCount()
-                            + ", failed=" + result.execution().failedCount());
-                    System.out.println("SIMULATION ONLY: no Kubernetes operations,"
-                            + " measured HTTP latency, or SLO evaluation.");
+                    System.out.println("\nStage 6: Optional CloudSim sandbox demonstration");
+                    System.out.println("VERIFIED refers to the notice claim, NOT its demand forecast.");
+                    System.out.println("LLM ESTIMATES (not independently calibrated): expectedUsers="
+                            + assessment.expectedUsers() + ", trafficMultiplier="
+                            + assessment.trafficMultiplier() + ", leadTimeMinutes="
+                            + assessment.leadTimeMinutes());
+                    if (assessment.leadTimeMinutes() == 0) {
+                        System.out.println("TIMING WARNING: lead time is zero; this is NOT"
+                                + " proof of proactive provisioning.");
+                    } else {
+                        System.out.println("TIMING WARNING: the claimed lead time has NOT"
+                                + " been cross-checked against a verified event timestamp.");
+                    }
+                    System.out.print("Type SIMULATE to use unvalidated estimates in CloudSim only > ");
+                    String acknowledgement = scanner.nextLine().trim();
+                    if (!VerifiedEventCloudSimHandoff.ACKNOWLEDGEMENT.equals(acknowledgement)) {
+                        System.out.println("CloudSim handoff SKIPPED: no explicit acknowledgement.");
+                    } else {
+                        var result = VerifiedEventCloudSimHandoff.run(
+                                assessment, finalResult, acknowledgement);
+                        System.out.printf("CloudSim managed VMs: %d -> %d%n",
+                                result.before().runningVms(), result.after().runningVms());
+                        System.out.println("Forecast VMs=" + result.forecast().recommendedVmCount());
+                        System.out.println("Safety=" + result.safety().approvalStatus());
+                        System.out.println("Execution=" + result.execution().status()
+                                + ", provisioned=" + result.execution().provisionedCount()
+                                + ", failed=" + result.execution().failedCount());
+                        System.out.println("SANDBOX ONLY: Uncalibrated traffic estimates; "
+                                + "no Kubernetes operations, measured HTTP latency, "
+                                + "or live SLO evaluation.");
+                    }
                 } else {
                     System.out.println("CloudSim handoff BLOCKED: final status="
                             + finalResult.status());
