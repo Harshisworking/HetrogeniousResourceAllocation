@@ -20,6 +20,8 @@ import com.harsh.cloudsim.agent.verification.model.VerificationStatus;
 import io.reactivex.rxjava3.core.Flowable;
 
 import java.util.Scanner;
+import java.time.Clock;
+import com.harsh.cloudsim.integration.EvidenceBackedTimingGate;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
@@ -50,9 +52,12 @@ public final class EventAgentCliRunner {
     public static void main(String[] args) {
         // Explicit opt-in: the normal CLI continues to verify and report only.
         // Any other CLI argument is rejected rather than silently ignored.
-        boolean cloudSimHandoff = args.length == 1 && "--cloudsim".equals(args[0]);
+        boolean proactiveCloudSim = args.length == 1 && "--proactive-cloudsim".equals(args[0]);
+        boolean cloudSimHandoff = proactiveCloudSim ||
+                (args.length == 1 && "--cloudsim".equals(args[0]));
         if (args.length > 0 && !cloudSimHandoff) {
-            throw new IllegalArgumentException("Usage: EventAgentCliRunner [--cloudsim]");
+            throw new IllegalArgumentException(
+                    "Usage: EventAgentCliRunner [--cloudsim|--proactive-cloudsim]");
         }
         verifyApiKey();
 
@@ -107,7 +112,8 @@ public final class EventAgentCliRunner {
                     verificationAgent,
                     evidenceFetcher,
                     claimVerificationService,
-                    cloudSimHandoff
+                    cloudSimHandoff,
+                    proactiveCloudSim
             );
         }
     }
@@ -120,7 +126,8 @@ public final class EventAgentCliRunner {
             EventVerificationAgent verificationAgent,
             SourceEvidenceFetcher evidenceFetcher,
             ClaimVerificationService claimVerificationService,
-            boolean cloudSimHandoff
+            boolean cloudSimHandoff,
+            boolean proactiveCloudSim
     ) {
         while (true) {
             System.out.print(
@@ -174,7 +181,8 @@ public final class EventAgentCliRunner {
                     verificationAgent,
                     evidenceFetcher,
                     claimVerificationService,
-                    cloudSimHandoff
+                    cloudSimHandoff,
+                    proactiveCloudSim
             );
         }
     }
@@ -189,7 +197,8 @@ public final class EventAgentCliRunner {
             EventVerificationAgent verificationAgent,
             SourceEvidenceFetcher evidenceFetcher,
             ClaimVerificationService claimVerificationService,
-            boolean cloudSimHandoff
+            boolean cloudSimHandoff,
+            boolean proactiveCloudSim
     ) {
         try {
             /*
@@ -337,6 +346,25 @@ public final class EventAgentCliRunner {
                 if (finalResult.status() == VerificationStatus.VERIFIED) {
                     System.out.println("\nStage 6: Optional CloudSim sandbox demonstration");
                     System.out.println("VERIFIED refers to the notice claim, NOT its demand forecast.");
+                    String serviceExcerpt = null;
+                    String serviceTimestamp = null;
+                    if (proactiveCloudSim) {
+                        System.out.println("PROACTIVE TIMING GATE: require an exact source sentence stating"
+                                + " when the online service opens, including an ISO-8601 timestamp with offset.");
+                        System.out.println("Ordinary notice publication dates and examination dates do NOT qualify.");
+                        System.out.print("Paste exact service-opening excerpt from fetched page > ");
+                        serviceExcerpt = scanner.nextLine().trim();
+                        System.out.print("Paste ISO-8601 timestamp VERBATIM from that excerpt > ");
+                        serviceTimestamp = scanner.nextLine().trim();
+                        var timing = EvidenceBackedTimingGate.evaluate(
+                                finalResult, evidence, serviceExcerpt, serviceTimestamp, Clock.systemUTC());
+                        System.out.println("Timing status=" + timing.status()
+                                + "; reason=" + timing.explanation());
+                        if (!timing.eligible()) {
+                            System.out.println("Proactive CloudSim handoff BLOCKED; no VMs allocated.");
+                            return;
+                        }
+                    }
                     System.out.println("LLM ESTIMATES (not independently calibrated): expectedUsers="
                             + assessment.expectedUsers() + ", trafficMultiplier="
                             + assessment.trafficMultiplier() + ", leadTimeMinutes="
@@ -353,8 +381,13 @@ public final class EventAgentCliRunner {
                     if (!VerifiedEventCloudSimHandoff.ACKNOWLEDGEMENT.equals(acknowledgement)) {
                         System.out.println("CloudSim handoff SKIPPED: no explicit acknowledgement.");
                     } else {
-                        var result = VerifiedEventCloudSimHandoff.run(
-                                assessment, finalResult, acknowledgement);
+                        var result = proactiveCloudSim
+                                ? VerifiedEventCloudSimHandoff.runProactive(
+                                    assessment, finalResult, evidence,
+                                    serviceExcerpt, serviceTimestamp,
+                                    acknowledgement, Clock.systemUTC())
+                                : VerifiedEventCloudSimHandoff.run(
+                                    assessment, finalResult, acknowledgement);
                         System.out.printf("CloudSim managed VMs: %d -> %d%n",
                                 result.before().runningVms(), result.after().runningVms());
                         System.out.println("Forecast VMs=" + result.forecast().recommendedVmCount());

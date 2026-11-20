@@ -5,6 +5,8 @@ import com.harsh.cloudsim.agent.verification.model.EventVerificationResult;
 import com.harsh.cloudsim.agent.verification.model.VerificationStatus;
 
 import java.util.Objects;
+import java.time.Clock;
+import com.harsh.cloudsim.agent.verification.evidence.SourceEvidence;
 
 /**
  * Explicit, simulation-only handoff for a verified event.
@@ -40,4 +42,24 @@ public final class VerifiedEventCloudSimHandoff {
         return ControlledPipelineDemo.run(
                 assessment, finalVerification, null, null, null);
     }
+
+    /** Proactive mode: stronger evidence gate than the legacy simulation-only run(). */
+    public static ControlledPipelineDemo.RunResult runProactive(
+            EventImpactAssessment assessment,
+            EventVerificationResult finalVerification,
+            SourceEvidence sourceEvidence,
+            String sourceExcerpt,
+            String sourceTimestamp,
+            String acknowledgement,
+            Clock clock) {
+        // Enforce evidence and time before allocating any CloudSim VM.
+        var decision = EvidenceBackedTimingGate.evaluate(
+                finalVerification, sourceEvidence, sourceExcerpt, sourceTimestamp, clock);
+        if (!decision.eligible()) {
+            throw new IllegalArgumentException("Proactive handoff denied: "
+                    + decision.status() + ": " + decision.explanation());
+        }
+        return run(assessment, finalVerification, acknowledgement);
+    }
+
 }
