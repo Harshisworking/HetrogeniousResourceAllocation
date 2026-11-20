@@ -22,6 +22,7 @@ import io.reactivex.rxjava3.core.Flowable;
 import java.util.Scanner;
 import java.time.Clock;
 import com.harsh.cloudsim.integration.EvidenceBackedTimingGate;
+import com.harsh.cloudsim.integration.PipelineAuditTrail;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
@@ -134,6 +135,10 @@ public final class EventAgentCliRunner {
                     "\nEvent description > "
             );
 
+            if (!scanner.hasNextLine()) {
+                stopWorkflow();
+                return;
+            }
             String originalEventClaim =
                     scanner.nextLine().trim();
 
@@ -154,6 +159,10 @@ public final class EventAgentCliRunner {
                     "Official source URL > "
             );
 
+            if (!scanner.hasNextLine()) {
+                stopWorkflow();
+                return;
+            }
             String sourceReference =
                     scanner.nextLine().trim();
 
@@ -200,6 +209,11 @@ public final class EventAgentCliRunner {
             boolean cloudSimHandoff,
             boolean proactiveCloudSim
     ) {
+        PipelineAuditTrail trail = PipelineAuditTrail.defaultTrail();
+        // Fail closed before doing any optional scaling when auditing is unavailable.
+        trail.initialize();
+        PipelineAuditTrail.Attempt audit = trail.begin(originalEventClaim, sourceReference,
+                proactiveCloudSim ? "PROACTIVE_CLOUDSIM" : cloudSimHandoff ? "CLOUDSIM" : "VERIFY_ONLY");
         try {
             /*
              * Stage 1:
@@ -219,6 +233,7 @@ public final class EventAgentCliRunner {
                     );
 
             printAssessment(assessment);
+            audit.assessment(assessment);
 
             EventVerificationRequest verificationRequest =
                     new EventVerificationRequest(
@@ -250,7 +265,7 @@ public final class EventAgentCliRunner {
                 printVerificationResult(
                         preliminaryResult
                 );
-
+                audit.verification(preliminaryResult).decision("PRELIMINARY_REJECTED");
                 return;
             }
 
@@ -274,6 +289,7 @@ public final class EventAgentCliRunner {
                     );
 
             printEvidenceSummary(evidence);
+            audit.evidence(evidence);
 
             EventVerificationResult evidenceResult =
                     verificationAgent.verify(
@@ -291,7 +307,7 @@ public final class EventAgentCliRunner {
                 printVerificationResult(
                         evidenceResult
                 );
-
+                audit.verification(evidenceResult).decision("EVIDENCE_REJECTED");
                 return;
             }
 
@@ -319,6 +335,7 @@ public final class EventAgentCliRunner {
             printClaimResult(
                     claimResult
             );
+            audit.claimVerification(claimResult);
 
             /*
              * Stage 5:
@@ -339,6 +356,8 @@ public final class EventAgentCliRunner {
             printVerificationResult(
                     finalResult
             );
+            audit.verification(finalResult).decision(finalResult.status() == VerificationStatus.VERIFIED
+                    ? "VERIFIED_NO_SCALING" : "VERIFICATION_" + finalResult.status());
 
             // Only the complete, evidence-backed Agent 2 result is eligible.
             // Never use the preliminary or evidence-only verification status.
@@ -353,14 +372,16 @@ public final class EventAgentCliRunner {
                                 + " when the online service opens, including an ISO-8601 timestamp with offset.");
                         System.out.println("Ordinary notice publication dates and examination dates do NOT qualify.");
                         System.out.print("Paste exact service-opening excerpt from fetched page > ");
-                        serviceExcerpt = scanner.nextLine().trim();
+                        serviceExcerpt = scanner.hasNextLine() ? scanner.nextLine().trim() : "";
                         System.out.print("Paste ISO-8601 timestamp VERBATIM from that excerpt > ");
-                        serviceTimestamp = scanner.nextLine().trim();
+                        serviceTimestamp = scanner.hasNextLine() ? scanner.nextLine().trim() : "";
                         var timing = EvidenceBackedTimingGate.evaluate(
                                 finalResult, evidence, serviceExcerpt, serviceTimestamp, Clock.systemUTC());
+                        audit.timing(timing, serviceExcerpt, serviceTimestamp);
                         System.out.println("Timing status=" + timing.status()
                                 + "; reason=" + timing.explanation());
                         if (!timing.eligible()) {
+                            audit.decision("TIMING_BLOCKED");
                             System.out.println("Proactive CloudSim handoff BLOCKED; no VMs allocated.");
                             return;
                         }
@@ -377,8 +398,10 @@ public final class EventAgentCliRunner {
                                 + " been cross-checked against a verified event timestamp.");
                     }
                     System.out.print("Type SIMULATE to use unvalidated estimates in CloudSim only > ");
-                    String acknowledgement = scanner.nextLine().trim();
+                    String acknowledgement = scanner.hasNextLine() ? scanner.nextLine().trim() : "";
+                    audit.acknowledgement(VerifiedEventCloudSimHandoff.ACKNOWLEDGEMENT.equals(acknowledgement));
                     if (!VerifiedEventCloudSimHandoff.ACKNOWLEDGEMENT.equals(acknowledgement)) {
+                        audit.decision("ACKNOWLEDGEMENT_DECLINED");
                         System.out.println("CloudSim handoff SKIPPED: no explicit acknowledgement.");
                     } else {
                         var result = proactiveCloudSim
@@ -388,6 +411,7 @@ public final class EventAgentCliRunner {
                                     acknowledgement, Clock.systemUTC())
                                 : VerifiedEventCloudSimHandoff.run(
                                     assessment, finalResult, acknowledgement);
+                        audit.execution(result).decision("CLOUDSIM_EXECUTED");
                         System.out.printf("CloudSim managed VMs: %d -> %d%n",
                                 result.before().runningVms(), result.after().runningVms());
                         System.out.println("Forecast VMs=" + result.forecast().recommendedVmCount());
@@ -405,6 +429,7 @@ public final class EventAgentCliRunner {
                 }
             }
         } catch (EventAssessmentParsingException exception) {
+            audit.failure("ASSESSMENT_PARSING", exception.getMessage());
             System.err.println(
                     "\nThe Event Intelligence Agent returned "
                             + "an invalid assessment."
@@ -418,6 +443,7 @@ public final class EventAgentCliRunner {
                     "Safety decision: BLOCKED"
             );
         } catch (RuntimeException exception) {
+            audit.failure("WORKFLOW_EXCEPTION", readableMessage(exception));
             System.err.println(
                     "\nThe event workflow could not be completed."
             );
@@ -429,6 +455,10 @@ public final class EventAgentCliRunner {
             System.err.println(
                     "Safety decision: BLOCKED"
             );
+        } finally {
+            String auditId = audit.save();
+            System.out.println("Pipeline audit saved: " + auditId
+                    + " (target/event-pipeline-audit.db)");
         }
     }
 
