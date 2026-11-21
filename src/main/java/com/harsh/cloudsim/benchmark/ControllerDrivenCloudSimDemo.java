@@ -1,6 +1,10 @@
 package com.harsh.cloudsim.benchmark;
 
 import com.harsh.cloudsim.model.HeterogeneousCluster;
+import com.harsh.cloudsim.agent.verification.evidence.SourceEvidence;
+import com.harsh.cloudsim.agent.verification.model.EventVerificationResult;
+import java.time.Clock;
+import java.time.Instant;
 import com.harsh.cloudsim.policy.FlexibleVmAllocationPolicy;
 import org.cloudbus.cloudsim.brokers.DatacenterBrokerSimple;
 import org.cloudbus.cloudsim.cloudlets.Cloudlet;
@@ -50,7 +54,7 @@ public final class ControllerDrivenCloudSimDemo {
                       List<UserTask> cloudlets, double extraVmFirstObservedSeconds,
                       double meanDispatchDelaySeconds, WorkloadProfile profile,
                       double baseVmObservedSeconds, double extraVmObservedSeconds,
-                      double extraVmDestroyObservedSeconds) {
+                      double extraVmDestroyObservedSeconds, double scaleInExecutionRequestSeconds) {
         public Run {
             decisions = List.copyOf(decisions);
             cloudlets = List.copyOf(cloudlets);
@@ -72,6 +76,30 @@ public final class ControllerDrivenCloudSimDemo {
                           WorkloadProfile profile) {
         Objects.requireNonNull(mode);
         Objects.requireNonNull(profile);
+        RuntimeScalingController.EventSignal fixture =
+                new RuntimeScalingController.EventSignal(FIXTURE_BURST_SECONDS, timingApproved);
+        return runConfigured(mode, timingApproved, profile, fixture);
+    }
+
+    /** Real evidence-gated entry point; rejected evidence falls back to observed-demand
+     * scaling. The caller explicitly maps wall-clock event time to the simulation epoch;
+     * this cannot be derived from a notice publication date or an LLM forecast.
+     * Experimental only: no production infrastructure is provisioned.
+     */
+    public static Run runWithEvidence(EventVerificationResult verification,
+                                      SourceEvidence source, String excerpt, String timestamp,
+                                      Clock clock, Instant simulationEpoch, WorkloadProfile profile) {
+        Objects.requireNonNull(simulationEpoch, "Explicit simulation epoch required");
+        Objects.requireNonNull(profile, "Profile required");
+        var gate = EvidenceBackedRuntimeSignal.evaluate(verification, source,
+                excerpt, timestamp, clock, simulationEpoch);
+        return runConfigured(RuntimeScalingController.Mode.PROACTIVE, gate.approved(),
+                profile, gate.signal());
+    }
+
+    private static Run runConfigured(RuntimeScalingController.Mode mode, boolean timingApproved,
+                                     WorkloadProfile profile,
+                                     RuntimeScalingController.EventSignal eventSignal) {
         CloudSim sim = new CloudSim();
         new DatacenterSimple(sim, HeterogeneousCluster.createClusterHosts(),
                 new FlexibleVmAllocationPolicy());
@@ -81,8 +109,6 @@ public final class ControllerDrivenCloudSimDemo {
         broker.submitVm(base);
         RuntimeScalingController controller = new RuntimeScalingController(mode,
                 RuntimeScalingController.Config.defaults());
-        RuntimeScalingController.EventSignal fixture =
-                new RuntimeScalingController.EventSignal(FIXTURE_BURST_SECONDS, timingApproved);
 
         // Clock-driving tiny marker cloudlets: identical across all strategies.
         // No marker task is counted as a user request or in the response metrics.
@@ -110,6 +136,7 @@ public final class ControllerDrivenCloudSimDemo {
         final double[] extraVmFirstObserved = {Double.NaN};
         final double[] baseVmFirstObserved = {Double.NaN};
         final double[] extraVmDestroyObserved = {Double.NaN};
+        final double[] scaleInExecutionRequest = {Double.NaN};
         final double[] lastProcessed = {-1};
         final List<RuntimeScalingController.Decision> actions = new ArrayList<>();
         sim.addOnClockTickListener(event -> {
@@ -151,7 +178,7 @@ public final class ControllerDrivenCloudSimDemo {
                 RuntimeScalingController.Observation snapshot =
                         new RuntimeScalingController.Observation(now, actualVms,
                                 unfinished, measuredCpu,
-                                mode == RuntimeScalingController.Mode.PROACTIVE ? fixture : null);
+                                mode == RuntimeScalingController.Mode.PROACTIVE ? eventSignal : null);
                 RuntimeScalingController.Decision decision = controller.evaluate(snapshot);
                 if (decision.action() != RuntimeScalingController.Action.NONE) {
                     actions.add(decision);
@@ -164,6 +191,9 @@ public final class ControllerDrivenCloudSimDemo {
                     if (decision.action() == RuntimeScalingController.Action.SCALE_IN
                             && extra.isCreated() && unfinished == 0) {
                         // Drain safety: no outstanding user tasks remain.
+                        // Record actual broker API invocation separately from policy intent.
+                        // An invocation is not proof that a VM was destroyed.
+                        scaleInExecutionRequest[0] = now;
                         broker.destroyVm(extra);
                     }
                 }
@@ -229,7 +259,8 @@ public final class ControllerDrivenCloudSimDemo {
                 latest - FIXTURE_BURST_SECONDS, actions, completed,
                 extraVmFirstObserved[0],
                 completed.isEmpty() ? Double.NaN : totalDispatchDelay / completed.size(),
-                profile, baseSeconds, extraSeconds, extraVmDestroyObserved[0]);
+                profile, baseSeconds, extraSeconds, extraVmDestroyObserved[0],
+                scaleInExecutionRequest[0]);
     }
 
     static double observedVmSeconds(double firstObserved, double destroyedObserved,
