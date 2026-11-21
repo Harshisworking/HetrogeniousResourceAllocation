@@ -47,12 +47,28 @@ class ControllerDrivenCloudSimDemoTest {
         }
     }
 
+    @Test void dispatchTimesAndVmObservationAreExplicit() {
+        for (var run : ControllerDrivenCloudSimDemo.runAll()) {
+            assertEquals(24, run.finished());
+            assertTrue(run.cloudlets().stream().allMatch(t ->
+                    t.dispatchSeconds() >= t.arrivalSeconds() &&
+                    t.startSeconds() >= t.dispatchSeconds()));
+            assertTrue(run.meanDispatchDelaySeconds() >= 0);
+            if (run.mode() == RuntimeScalingController.Mode.STATIC) {
+                assertTrue(Double.isNaN(run.extraVmFirstObservedSeconds()));
+            } else {
+                assertTrue(Double.isFinite(run.extraVmFirstObservedSeconds()));
+            }
+        }
+    }
+
     @Test void csvExportUsesFourDistinctScenarios(@TempDir Path temp) throws Exception {
         Path csv = temp.resolve("runtime.csv");
         ControllerDrivenCloudSimDemo.writeCsv(ControllerDrivenCloudSimDemo.runAll(), csv);
         List<String> lines = Files.readAllLines(csv);
         assertEquals(5, lines.size());
         assertTrue(lines.get(0).contains("fixture_timing_approved"));
+        assertTrue(lines.get(0).contains("extra_vm_first_observed_seconds"));
         assertTrue(lines.stream().anyMatch(s -> s.startsWith("PROACTIVE,false,")));
         assertTrue(lines.stream().anyMatch(s -> s.startsWith("PROACTIVE,true,")));
     }

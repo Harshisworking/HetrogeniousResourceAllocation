@@ -20,6 +20,8 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Objects;
 
 /**
@@ -37,15 +39,16 @@ public final class ControllerDrivenCloudSimDemo {
 
     public static final double FIXTURE_BURST_SECONDS = 20.0;
     public static final int USER_TASKS = 24;
-    private static final int MAX_DISPATCH_PER_TICK = 4;
+    private static final int TASKS_PER_SIMULATED_SECOND = 4;
     private static final long USER_TASK_LENGTH_MI = 20_000;
 
-    public record UserTask(long id, double arrivalSeconds, double startSeconds,
-                           double finishSeconds, double responseSeconds, long vmId) {}
+    public record UserTask(long id, double arrivalSeconds, double dispatchSeconds,
+                           double startSeconds, double finishSeconds, double responseSeconds, long vmId) {}
     public record Run(RuntimeScalingController.Mode mode, boolean timingApproved,
                       int submitted, int finished, int failed, double meanResponseSeconds,
                       double makespanSeconds, List<RuntimeScalingController.Decision> decisions,
-                      List<UserTask> cloudlets) {
+                      List<UserTask> cloudlets, double extraVmFirstObservedSeconds,
+                      double meanDispatchDelaySeconds) {
         public Run {
             decisions = List.copyOf(decisions);
             cloudlets = List.copyOf(cloudlets);
@@ -93,7 +96,10 @@ public final class ControllerDrivenCloudSimDemo {
         }
         final boolean[] burstArrived = {false};
         final boolean[] extraRequested = {false};
-        final int[] routingIndex = {0};
+        SimulationDispatchQuota dispatchQuota = new SimulationDispatchQuota(
+                FIXTURE_BURST_SECONDS, 1.0, TASKS_PER_SIMULATED_SECOND);
+        Map<Long, Double> dispatchTimes = new HashMap<>();
+        final double[] extraVmFirstObserved = {Double.NaN};
         final double[] lastProcessed = {-1};
         final List<RuntimeScalingController.Decision> actions = new ArrayList<>();
         sim.addOnClockTickListener(event -> {
@@ -105,6 +111,10 @@ public final class ControllerDrivenCloudSimDemo {
             if (!burstArrived[0] && now >= FIXTURE_BURST_SECONDS) {
                 burstArrived[0] = true;
                 backlog.addAll(userTasks);
+            }
+
+            if (extra.isCreated() && Double.isNaN(extraVmFirstObserved[0])) {
+                extraVmFirstObserved[0] = now;
             }
 
             int unfinished = backlog.size();
@@ -144,20 +154,29 @@ public final class ControllerDrivenCloudSimDemo {
                 List<Vm> ready = new ArrayList<>();
                 if (base.isCreated()) ready.add(base);
                 if (extra.isCreated()) ready.add(extra);
-                int count = Math.min(MAX_DISPATCH_PER_TICK, backlog.size());
+                // Callback frequency differs by VM lifecycle and cloudlet finish events.
+                // Quota depends only on simulation time, so those extra callbacks
+                // cannot grant one scenario more ingress capacity than another.
+                int count = dispatchQuota.available(now, backlog.size());
                 for (int i = 0; i < count && !ready.isEmpty(); i++) {
                     Cloudlet task = backlog.removeFirst();
-                    Vm selected = ready.get(routingIndex[0]++ % ready.size());
+                    // Deterministic least-normalized-outstanding-work routing.
+                    // The already-submitted workload on each VM (in MI) is
+                    // divided by its MIPS; tie breaks to lower VM ID.
+                    Vm selected = ready.stream().min(Comparator
+                            .comparingDouble((Vm vm) -> outstandingWork(userTasks, vm) / vm.getMips())
+                            .thenComparingLong(Vm::getId)).orElseThrow();
+                    dispatchTimes.put(task.getId(), now);
                     broker.bindCloudletToVm(task, selected);
-                    // Submitted at actual simulated arrival/dispatch time.
                     broker.submitCloudlet(task);
+                    dispatchQuota.recordDispatch(1);
                 }
             }
         });
         sim.start();
 
         List<UserTask> completed = new ArrayList<>();
-        double total = 0, latest = FIXTURE_BURST_SECONDS;
+        double total = 0, totalDispatchDelay = 0, latest = FIXTURE_BURST_SECONDS;
         for (Cloudlet task : userTasks) {
             if (!task.isFinished()) continue;
             double start = task.getExecStartTime();
@@ -166,17 +185,35 @@ public final class ControllerDrivenCloudSimDemo {
                     || start < FIXTURE_BURST_SECONDS - 0.00001 || finish < start) {
                 throw new IllegalStateException("Invalid CloudSim timestamp: " + task.getId());
             }
+            Double dispatchedAt = dispatchTimes.get(task.getId());
+            if (dispatchedAt == null || dispatchedAt < FIXTURE_BURST_SECONDS - 0.00001 ||
+                    start + 0.00001 < dispatchedAt) {
+                throw new IllegalStateException("Invalid dispatch/start ordering: " + task.getId());
+            }
             double response = finish - FIXTURE_BURST_SECONDS;
             completed.add(new UserTask(task.getId(), FIXTURE_BURST_SECONDS,
-                    start, finish, response, task.getVm().getId()));
+                    dispatchedAt, start, finish, response, task.getVm().getId()));
             total += response;
+            totalDispatchDelay += dispatchedAt - FIXTURE_BURST_SECONDS;
             latest = Math.max(latest, finish);
         }
         completed.sort(Comparator.comparingLong(UserTask::id));
         return new Run(mode, timingApproved, USER_TASKS, completed.size(),
                 USER_TASKS - completed.size(),
                 completed.isEmpty() ? Double.NaN : total / completed.size(),
-                latest - FIXTURE_BURST_SECONDS, actions, completed);
+                latest - FIXTURE_BURST_SECONDS, actions, completed,
+                extraVmFirstObserved[0],
+                completed.isEmpty() ? Double.NaN : totalDispatchDelay / completed.size());
+    }
+
+    private static double outstandingWork(List<Cloudlet> userTasks, Vm vm) {
+        double outstandingMi = 0;
+        for (Cloudlet task : userTasks) {
+            if (!task.isFinished() && task.getVm() == vm) {
+                outstandingMi += USER_TASK_LENGTH_MI;
+            }
+        }
+        return outstandingMi;
     }
 
     public static List<Run> runAll() {
@@ -190,14 +227,15 @@ public final class ControllerDrivenCloudSimDemo {
         if (destination.toAbsolutePath().getParent() != null)
             Files.createDirectories(destination.toAbsolutePath().getParent());
         List<String> rows = new ArrayList<>();
-        rows.add("mode,fixture_timing_approved,submitted,finished,failed,mean_response_seconds,makespan_seconds,scale_out_actions");
+        rows.add("mode,fixture_timing_approved,submitted,finished,failed,mean_response_seconds,makespan_seconds,scale_out_actions,extra_vm_first_observed_seconds,mean_dispatch_delay_seconds");
         for (Run result : results) {
             long scaleOuts = result.decisions().stream().filter(d ->
                     d.action() == RuntimeScalingController.Action.SCALE_OUT).count();
-            rows.add(String.format(Locale.ROOT, "%s,%s,%d,%d,%d,%.6f,%.6f,%d",
+            rows.add(String.format(Locale.ROOT, "%s,%s,%d,%d,%d,%.6f,%.6f,%d,%.6f,%.6f",
                     result.mode(), result.timingApproved(), result.submitted(),
                     result.finished(), result.failed(), result.meanResponseSeconds(),
-                    result.makespanSeconds(), scaleOuts));
+                    result.makespanSeconds(), scaleOuts, result.extraVmFirstObservedSeconds(),
+                    result.meanDispatchDelaySeconds()));
         }
         Files.write(destination, rows, StandardCharsets.UTF_8);
     }
@@ -207,9 +245,10 @@ public final class ControllerDrivenCloudSimDemo {
         System.out.println("PHASE 10 EXPERIMENTAL RUNTIME CONTROLLER: CONTROLLED EVENT FIXTURE ONLY");
         for (Run r : results) {
             System.out.printf(Locale.ROOT,
-                    "%s approved=%s finished=%d/%d meanResponse=%.3fs makespan=%.3fs decisions=%s%n",
+                    "%s approved=%s finished=%d/%d meanResponse=%.3fs makespan=%.3fs vm1FirstObserved=%.3fs meanDispatchDelay=%.3fs decisions=%s%n",
                     r.mode(), r.timingApproved(), r.finished(), r.submitted(),
-                    r.meanResponseSeconds(), r.makespanSeconds(), r.decisions());
+                    r.meanResponseSeconds(), r.makespanSeconds(),
+                    r.extraVmFirstObservedSeconds(), r.meanDispatchDelaySeconds(), r.decisions());
             if (r.failed() != 0) throw new IllegalStateException("Incomplete user workload");
         }
         Path csv = Path.of("target", "controller-driven-cloudsim.csv");
