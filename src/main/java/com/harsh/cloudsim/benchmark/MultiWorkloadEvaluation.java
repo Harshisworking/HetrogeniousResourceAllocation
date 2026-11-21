@@ -64,5 +64,8 @@ public final class MultiWorkloadEvaluation {
         Path output = Path.of("target", "phase11-multi-workload.csv");
         writeCsv(runs, output);
         System.out.println("CSV: " + output.toAbsolutePath());
+        Path lifecycle = Path.of("target", "phase12-vm-lifecycle-audit.csv");
+        VmLifecycleAudit.writeCsv(runs, lifecycle);
+        System.out.println("VM lifecycle audit CSV: " + lifecycle.toAbsolutePath());
     }
 }
