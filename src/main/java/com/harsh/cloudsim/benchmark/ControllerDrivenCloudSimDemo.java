@@ -48,7 +48,9 @@ public final class ControllerDrivenCloudSimDemo {
                       int submitted, int finished, int failed, double meanResponseSeconds,
                       double makespanSeconds, List<RuntimeScalingController.Decision> decisions,
                       List<UserTask> cloudlets, double extraVmFirstObservedSeconds,
-                      double meanDispatchDelaySeconds) {
+                      double meanDispatchDelaySeconds, WorkloadProfile profile,
+                      double baseVmObservedSeconds, double extraVmObservedSeconds,
+                      double extraVmDestroyObservedSeconds) {
         public Run {
             decisions = List.copyOf(decisions);
             cloudlets = List.copyOf(cloudlets);
@@ -63,7 +65,13 @@ public final class ControllerDrivenCloudSimDemo {
     }
 
     public static Run run(RuntimeScalingController.Mode mode, boolean timingApproved) {
+        return run(mode, timingApproved, WorkloadProfile.BURST);
+    }
+
+    public static Run run(RuntimeScalingController.Mode mode, boolean timingApproved,
+                          WorkloadProfile profile) {
         Objects.requireNonNull(mode);
+        Objects.requireNonNull(profile);
         CloudSim sim = new CloudSim();
         new DatacenterSimple(sim, HeterogeneousCluster.createClusterHosts(),
                 new FlexibleVmAllocationPolicy());
@@ -79,7 +87,7 @@ public final class ControllerDrivenCloudSimDemo {
         // Clock-driving tiny marker cloudlets: identical across all strategies.
         // No marker task is counted as a user request or in the response metrics.
         List<Cloudlet> markers = new ArrayList<>();
-        for (int s = 15; s <= 120; s++) {
+        for (int s = 15; s <= Math.max(120, (int) profile.lastArrivalSeconds() + 120); s++) {
             Cloudlet marker = new CloudletSimple(10_000L + s, 1, 1);
             marker.setSubmissionDelay(s);
             broker.bindCloudletToVm(marker, base);
@@ -89,17 +97,19 @@ public final class ControllerDrivenCloudSimDemo {
 
         ArrayDeque<Cloudlet> backlog = new ArrayDeque<>();
         List<Cloudlet> userTasks = new ArrayList<>();
-        for (int i = 0; i < USER_TASKS; i++) {
+        for (int i = 0; i < profile.taskCount(); i++) {
             Cloudlet task = new CloudletSimple(i, USER_TASK_LENGTH_MI, 1);
             task.setUtilizationModelCpu(new UtilizationModelFull());
             userTasks.add(task);
         }
-        final boolean[] burstArrived = {false};
+        final int[] nextArrivalIndex = {0};
         final boolean[] extraRequested = {false};
         SimulationDispatchQuota dispatchQuota = new SimulationDispatchQuota(
                 FIXTURE_BURST_SECONDS, 1.0, TASKS_PER_SIMULATED_SECOND);
         Map<Long, Double> dispatchTimes = new HashMap<>();
         final double[] extraVmFirstObserved = {Double.NaN};
+        final double[] baseVmFirstObserved = {Double.NaN};
+        final double[] extraVmDestroyObserved = {Double.NaN};
         final double[] lastProcessed = {-1};
         final List<RuntimeScalingController.Decision> actions = new ArrayList<>();
         sim.addOnClockTickListener(event -> {
@@ -108,18 +118,27 @@ public final class ControllerDrivenCloudSimDemo {
             if (now - lastProcessed[0] < 0.000001) return;
             lastProcessed[0] = now;
 
-            if (!burstArrived[0] && now >= FIXTURE_BURST_SECONDS) {
-                burstArrived[0] = true;
-                backlog.addAll(userTasks);
+            // Release each task only at its own scheduled fixture arrival.
+            while (nextArrivalIndex[0] < userTasks.size() &&
+                    profile.arrivalSeconds(nextArrivalIndex[0]) <= now + 1e-8) {
+                backlog.addLast(userTasks.get(nextArrivalIndex[0]++));
             }
 
+            if (base.isCreated() && Double.isNaN(baseVmFirstObserved[0])) {
+                baseVmFirstObserved[0] = now;
+            }
             if (extra.isCreated() && Double.isNaN(extraVmFirstObserved[0])) {
                 extraVmFirstObserved[0] = now;
+            }
+            if (!extra.isCreated() && Double.isFinite(extraVmFirstObserved[0]) &&
+                    Double.isNaN(extraVmDestroyObserved[0])) {
+                extraVmDestroyObserved[0] = now;
             }
 
             int unfinished = backlog.size();
             for (Cloudlet task : userTasks) {
-                if (!backlog.contains(task) && !task.isFinished() && burstArrived[0]) {
+                if (!backlog.contains(task) && !task.isFinished() &&
+                        task.getId() < nextArrivalIndex[0]) {
                     unfinished++;
                 }
             }
@@ -150,7 +169,7 @@ public final class ControllerDrivenCloudSimDemo {
                 }
             }
 
-            if (burstArrived[0]) {
+            if (!backlog.isEmpty()) {
                 List<Vm> ready = new ArrayList<>();
                 if (base.isCreated()) ready.add(base);
                 if (extra.isCreated()) ready.add(extra);
@@ -181,29 +200,45 @@ public final class ControllerDrivenCloudSimDemo {
             if (!task.isFinished()) continue;
             double start = task.getExecStartTime();
             double finish = task.getFinishTime();
+            double arrival = profile.arrivalSeconds((int) task.getId());
             if (!Double.isFinite(start) || !Double.isFinite(finish)
-                    || start < FIXTURE_BURST_SECONDS - 0.00001 || finish < start) {
+                    || start < arrival - 0.00001 || finish < start) {
                 throw new IllegalStateException("Invalid CloudSim timestamp: " + task.getId());
             }
             Double dispatchedAt = dispatchTimes.get(task.getId());
-            if (dispatchedAt == null || dispatchedAt < FIXTURE_BURST_SECONDS - 0.00001 ||
+            if (dispatchedAt == null || dispatchedAt < arrival - 0.00001 ||
                     start + 0.00001 < dispatchedAt) {
                 throw new IllegalStateException("Invalid dispatch/start ordering: " + task.getId());
             }
-            double response = finish - FIXTURE_BURST_SECONDS;
-            completed.add(new UserTask(task.getId(), FIXTURE_BURST_SECONDS,
+            double response = finish - arrival;
+            completed.add(new UserTask(task.getId(), arrival,
                     dispatchedAt, start, finish, response, task.getVm().getId()));
             total += response;
-            totalDispatchDelay += dispatchedAt - FIXTURE_BURST_SECONDS;
+            totalDispatchDelay += dispatchedAt - arrival;
             latest = Math.max(latest, finish);
         }
         completed.sort(Comparator.comparingLong(UserTask::id));
-        return new Run(mode, timingApproved, USER_TASKS, completed.size(),
-                USER_TASKS - completed.size(),
+        // VM-seconds are observed availability within the measured user-workload window.
+        // This is a sampled, non-billing approximation, not an energy model.
+        double baseSeconds = observedVmSeconds(baseVmFirstObserved[0], Double.NaN, latest);
+        double extraSeconds = observedVmSeconds(extraVmFirstObserved[0],
+                extraVmDestroyObserved[0], latest);
+        return new Run(mode, timingApproved, profile.taskCount(), completed.size(),
+                profile.taskCount() - completed.size(),
                 completed.isEmpty() ? Double.NaN : total / completed.size(),
                 latest - FIXTURE_BURST_SECONDS, actions, completed,
                 extraVmFirstObserved[0],
-                completed.isEmpty() ? Double.NaN : totalDispatchDelay / completed.size());
+                completed.isEmpty() ? Double.NaN : totalDispatchDelay / completed.size(),
+                profile, baseSeconds, extraSeconds, extraVmDestroyObserved[0]);
+    }
+
+    static double observedVmSeconds(double firstObserved, double destroyedObserved,
+                                    double workloadCompletionSeconds) {
+        if (!Double.isFinite(firstObserved)) return 0.0;
+        double stop = Double.isFinite(destroyedObserved)
+                ? Math.min(destroyedObserved, workloadCompletionSeconds)
+                : workloadCompletionSeconds;
+        return Math.max(0.0, stop - firstObserved);
     }
 
     private static double outstandingWork(List<Cloudlet> userTasks, Vm vm) {
