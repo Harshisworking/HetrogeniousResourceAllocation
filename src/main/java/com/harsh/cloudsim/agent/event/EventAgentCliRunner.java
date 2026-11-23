@@ -7,6 +7,7 @@ import com.google.adk.sessions.Session;
 import com.google.genai.types.Content;
 import com.google.genai.types.Part;
 import com.harsh.cloudsim.agent.event.model.EventImpactAssessment;
+import com.harsh.cloudsim.integration.VerifiedEventCloudSimHandoff;
 import com.harsh.cloudsim.agent.verification.EventVerificationAgent;
 import com.harsh.cloudsim.agent.verification.claim.ClaimVerificationService;
 import com.harsh.cloudsim.agent.verification.claim.model.ClaimVerificationResult;
@@ -19,6 +20,9 @@ import com.harsh.cloudsim.agent.verification.model.VerificationStatus;
 import io.reactivex.rxjava3.core.Flowable;
 
 import java.util.Scanner;
+import java.time.Clock;
+import com.harsh.cloudsim.integration.EvidenceBackedTimingGate;
+import com.harsh.cloudsim.integration.PipelineAuditTrail;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
@@ -47,6 +51,15 @@ public final class EventAgentCliRunner {
     }
 
     public static void main(String[] args) {
+        // Explicit opt-in: the normal CLI continues to verify and report only.
+        // Any other CLI argument is rejected rather than silently ignored.
+        boolean proactiveCloudSim = args.length == 1 && "--proactive-cloudsim".equals(args[0]);
+        boolean cloudSimHandoff = proactiveCloudSim ||
+                (args.length == 1 && "--cloudsim".equals(args[0]));
+        if (args.length > 0 && !cloudSimHandoff) {
+            throw new IllegalArgumentException(
+                    "Usage: EventAgentCliRunner [--cloudsim|--proactive-cloudsim]");
+        }
         verifyApiKey();
 
         RunConfig runConfig =
@@ -99,7 +112,9 @@ public final class EventAgentCliRunner {
                     runConfig,
                     verificationAgent,
                     evidenceFetcher,
-                    claimVerificationService
+                    claimVerificationService,
+                    cloudSimHandoff,
+                    proactiveCloudSim
             );
         }
     }
@@ -111,13 +126,19 @@ public final class EventAgentCliRunner {
             RunConfig runConfig,
             EventVerificationAgent verificationAgent,
             SourceEvidenceFetcher evidenceFetcher,
-            ClaimVerificationService claimVerificationService
+            ClaimVerificationService claimVerificationService,
+            boolean cloudSimHandoff,
+            boolean proactiveCloudSim
     ) {
         while (true) {
             System.out.print(
                     "\nEvent description > "
             );
 
+            if (!scanner.hasNextLine()) {
+                stopWorkflow();
+                return;
+            }
             String originalEventClaim =
                     scanner.nextLine().trim();
 
@@ -138,6 +159,10 @@ public final class EventAgentCliRunner {
                     "Official source URL > "
             );
 
+            if (!scanner.hasNextLine()) {
+                stopWorkflow();
+                return;
+            }
             String sourceReference =
                     scanner.nextLine().trim();
 
@@ -156,6 +181,7 @@ public final class EventAgentCliRunner {
             }
 
             processEvent(
+                    scanner,
                     originalEventClaim,
                     sourceReference,
                     eventIntelligenceRunner,
@@ -163,12 +189,15 @@ public final class EventAgentCliRunner {
                     runConfig,
                     verificationAgent,
                     evidenceFetcher,
-                    claimVerificationService
+                    claimVerificationService,
+                    cloudSimHandoff,
+                    proactiveCloudSim
             );
         }
     }
 
     private static void processEvent(
+            Scanner scanner,
             String originalEventClaim,
             String sourceReference,
             InMemoryRunner eventIntelligenceRunner,
@@ -176,8 +205,15 @@ public final class EventAgentCliRunner {
             RunConfig runConfig,
             EventVerificationAgent verificationAgent,
             SourceEvidenceFetcher evidenceFetcher,
-            ClaimVerificationService claimVerificationService
+            ClaimVerificationService claimVerificationService,
+            boolean cloudSimHandoff,
+            boolean proactiveCloudSim
     ) {
+        PipelineAuditTrail trail = PipelineAuditTrail.defaultTrail();
+        // Fail closed before doing any optional scaling when auditing is unavailable.
+        trail.initialize();
+        PipelineAuditTrail.Attempt audit = trail.begin(originalEventClaim, sourceReference,
+                proactiveCloudSim ? "PROACTIVE_CLOUDSIM" : cloudSimHandoff ? "CLOUDSIM" : "VERIFY_ONLY");
         try {
             /*
              * Stage 1:
@@ -197,6 +233,7 @@ public final class EventAgentCliRunner {
                     );
 
             printAssessment(assessment);
+            audit.assessment(assessment);
 
             EventVerificationRequest verificationRequest =
                     new EventVerificationRequest(
@@ -228,7 +265,7 @@ public final class EventAgentCliRunner {
                 printVerificationResult(
                         preliminaryResult
                 );
-
+                audit.verification(preliminaryResult).decision("PRELIMINARY_REJECTED");
                 return;
             }
 
@@ -252,6 +289,7 @@ public final class EventAgentCliRunner {
                     );
 
             printEvidenceSummary(evidence);
+            audit.evidence(evidence);
 
             EventVerificationResult evidenceResult =
                     verificationAgent.verify(
@@ -269,7 +307,7 @@ public final class EventAgentCliRunner {
                 printVerificationResult(
                         evidenceResult
                 );
-
+                audit.verification(evidenceResult).decision("EVIDENCE_REJECTED");
                 return;
             }
 
@@ -297,6 +335,7 @@ public final class EventAgentCliRunner {
             printClaimResult(
                     claimResult
             );
+            audit.claimVerification(claimResult);
 
             /*
              * Stage 5:
@@ -317,7 +356,80 @@ public final class EventAgentCliRunner {
             printVerificationResult(
                     finalResult
             );
+            audit.verification(finalResult).decision(finalResult.status() == VerificationStatus.VERIFIED
+                    ? "VERIFIED_NO_SCALING" : "VERIFICATION_" + finalResult.status());
+
+            // Only the complete, evidence-backed Agent 2 result is eligible.
+            // Never use the preliminary or evidence-only verification status.
+            if (cloudSimHandoff) {
+                if (finalResult.status() == VerificationStatus.VERIFIED) {
+                    System.out.println("\nStage 6: Optional CloudSim sandbox demonstration");
+                    System.out.println("VERIFIED refers to the notice claim, NOT its demand forecast.");
+                    String serviceExcerpt = null;
+                    String serviceTimestamp = null;
+                    if (proactiveCloudSim) {
+                        System.out.println("PROACTIVE TIMING GATE: require an exact source sentence stating"
+                                + " when the online service opens, including an ISO-8601 timestamp with offset.");
+                        System.out.println("Ordinary notice publication dates and examination dates do NOT qualify.");
+                        System.out.print("Paste exact service-opening excerpt from fetched page > ");
+                        serviceExcerpt = scanner.hasNextLine() ? scanner.nextLine().trim() : "";
+                        System.out.print("Paste ISO-8601 timestamp VERBATIM from that excerpt > ");
+                        serviceTimestamp = scanner.hasNextLine() ? scanner.nextLine().trim() : "";
+                        var timing = EvidenceBackedTimingGate.evaluate(
+                                finalResult, evidence, serviceExcerpt, serviceTimestamp, Clock.systemUTC());
+                        audit.timing(timing, serviceExcerpt, serviceTimestamp);
+                        System.out.println("Timing status=" + timing.status()
+                                + "; reason=" + timing.explanation());
+                        if (!timing.eligible()) {
+                            audit.decision("TIMING_BLOCKED");
+                            System.out.println("Proactive CloudSim handoff BLOCKED; no VMs allocated.");
+                            return;
+                        }
+                    }
+                    System.out.println("LLM ESTIMATES (not independently calibrated): expectedUsers="
+                            + assessment.expectedUsers() + ", trafficMultiplier="
+                            + assessment.trafficMultiplier() + ", leadTimeMinutes="
+                            + assessment.leadTimeMinutes());
+                    if (assessment.leadTimeMinutes() == 0) {
+                        System.out.println("TIMING WARNING: lead time is zero; this is NOT"
+                                + " proof of proactive provisioning.");
+                    } else {
+                        System.out.println("TIMING WARNING: the claimed lead time has NOT"
+                                + " been cross-checked against a verified event timestamp.");
+                    }
+                    System.out.print("Type SIMULATE to use unvalidated estimates in CloudSim only > ");
+                    String acknowledgement = scanner.hasNextLine() ? scanner.nextLine().trim() : "";
+                    audit.acknowledgement(VerifiedEventCloudSimHandoff.ACKNOWLEDGEMENT.equals(acknowledgement));
+                    if (!VerifiedEventCloudSimHandoff.ACKNOWLEDGEMENT.equals(acknowledgement)) {
+                        audit.decision("ACKNOWLEDGEMENT_DECLINED");
+                        System.out.println("CloudSim handoff SKIPPED: no explicit acknowledgement.");
+                    } else {
+                        var result = proactiveCloudSim
+                                ? VerifiedEventCloudSimHandoff.runProactive(
+                                    assessment, finalResult, evidence,
+                                    serviceExcerpt, serviceTimestamp,
+                                    acknowledgement, Clock.systemUTC())
+                                : VerifiedEventCloudSimHandoff.run(
+                                    assessment, finalResult, acknowledgement);
+                        audit.execution(result).decision("CLOUDSIM_EXECUTED");
+                        System.out.printf("CloudSim managed VMs: %d -> %d%n",
+                                result.before().runningVms(), result.after().runningVms());
+                        System.out.println("Forecast VMs=" + result.forecast().recommendedVmCount());
+                        System.out.println("Safety=" + result.safety().approvalStatus());
+                        System.out.println("Execution=" + result.execution().status()
+                                + ", provisioned=" + result.execution().provisionedCount()
+                                + ", failed=" + result.execution().failedCount());
+                        System.out.println("SANDBOX ONLY: Uncalibrated traffic estimates; "
+                                + "no Kubernetes operations, measured HTTP latency, "
+                                + "or live SLO evaluation.");
+                    }
+                } else {
+                    System.out.println("CloudSim handoff BLOCKED: final status="
+                            + finalResult.status());
+                }
+            }
         } catch (EventAssessmentParsingException exception) {
+            audit.failure("ASSESSMENT_PARSING", exception.getMessage());
             System.err.println(
                     "\nThe Event Intelligence Agent returned "
                             + "an invalid assessment."
@@ -331,6 +443,7 @@ public final class EventAgentCliRunner {
                     "Safety decision: BLOCKED"
             );
         } catch (RuntimeException exception) {
+            audit.failure("WORKFLOW_EXCEPTION", readableMessage(exception));
             System.err.println(
                     "\nThe event workflow could not be completed."
             );
@@ -342,6 +455,10 @@ public final class EventAgentCliRunner {
             System.err.println(
                     "Safety decision: BLOCKED"
             );
+        } finally {
+            String auditId = audit.save();
+            System.out.println("Pipeline audit saved: " + auditId
+                    + " (target/event-pipeline-audit.db)");
         }
     }
 
