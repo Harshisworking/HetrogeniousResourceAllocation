@@ -1,0 +1,29 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: portal-load
+  namespace: agentic-demo
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: load
+          image: python:3.12-slim
+          command: ["python", "-u", "/load/load.py"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            - name: script
+              mountPath: /load
+              readOnly: true
+      volumes:
+        - name: script
+          configMap:
+            name: portal-benchmark-load

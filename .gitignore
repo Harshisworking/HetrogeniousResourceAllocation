@@ -19,3 +19,60 @@ out/
 .DS_Store
 Thumbs.db
 desktop.ini
+# Python virtual environments
+.venv/
+.venv-linux/
+venv/
+env/
+
+# Python cache
+__pycache__/
+.pytest_cache/
+*.pyc
+
+# Java build outputs
+target/
+*.class
+
+# Secrets and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.kubeconfig
+*controller.yaml
+
+# Generated runtime data
+agentic-k8s/run/
+*.sqlite3
+*.db
+*.log
+
+# IDE files
+.idea/
+.vscode/
+
+
+# Backup files
+*.bak
+*.before-fix
+
+# Generated Python package metadata
+*.egg-info/
+
+# Linux virtual environments
+.venv-linux/
+.venv/
+
+# Runtime artifacts
+agentic-k8s/run/
+target/
+
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
